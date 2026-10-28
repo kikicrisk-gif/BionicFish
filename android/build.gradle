@@ -1,0 +1,71 @@
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}
+
+project(':app') {
+    apply plugin: 'com.android.application'
+
+    layout.buildDirectory.set(
+            rootProject.layout.projectDirectory.dir('build/app')
+    )
+
+    android {
+        namespace 'com.fish.phonetailtest'
+        compileSdk 35
+        ndkVersion '30.0.16248370'
+
+        defaultConfig {
+            applicationId 'com.fish.phonetailtest'
+            minSdk 30
+            targetSdk 35
+
+            versionCode 14
+            versionName '14.0'
+
+            ndk {
+                abiFilters 'arm64-v8a'
+            }
+
+            externalNativeBuild {
+                cmake {
+                    cppFlags '-std=c++17'
+                    arguments '-DANDROID_STL=c++_shared'
+                }
+            }
+        }
+
+        compileOptions {
+            sourceCompatibility JavaVersion.VERSION_17
+            targetCompatibility JavaVersion.VERSION_17
+        }
+
+        sourceSets {
+            main {
+                java.srcDirs = ['phonetest']
+                assets.srcDirs = ['vision/assets']
+                manifest.srcFile 'phonetest/apkv1.xml'
+            }
+        }
+
+        externalNativeBuild {
+            cmake {
+                path file('vision/cpp/CMakeLists.txt')
+                version '3.31.6'
+            }
+        }
+    }
+
+    dependencies {
+        implementation 'androidx.activity:activity:1.9.3'
+        implementation 'androidx.core:core:1.13.1'
+
+        implementation 'androidx.camera:camera-core:1.4.2'
+        implementation 'androidx.camera:camera-camera2:1.4.2'
+        implementation 'androidx.camera:camera-lifecycle:1.4.2'
+        implementation 'androidx.camera:camera-view:1.4.2'
+        implementation 'androidx.camera:camera-video:1.4.2'
+        implementation 'androidx.camera:camera-effects:1.4.2'
+
+        implementation 'com.github.mik3y:usb-serial-for-android:3.11.0'
+    }
+}

@@ -1,0 +1,11 @@
+**/build/
+**/.gradle/
+**/.cxx/
+**/.externalNativeBuild/
+local.properties
+*.apk
+*.bak
+*.jks
+*.keystore
+model-backups/
+build-log.txt
