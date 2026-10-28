@@ -26,7 +26,8 @@ static uint64_t plan[5][3] = {
 enum Mode : uint8_t {
     IDLE = 0,
     ROUTE = 1,
-    STOPPING = 3
+    STOPPING = 3,
+    MANUAL = 4
 };
 
 static volatile uint8_t mode = IDLE;
@@ -38,6 +39,19 @@ static float stopFrom = CENTER;
 static char inputLine[384];
 static size_t inputLength = 0;
 static bool overflowed = false;
+
+// Experimental six-level hold steering.
+static constexpr uint64_t MANUAL_LEASE_US = 1000000;
+
+static uint64_t manualLeaseUs = 0;
+static uint64_t manualPhaseUs = 0;
+static uint64_t swimPeriodUs = PERIOD_US;
+
+static float manualLeft = 60;
+static float manualRight = 120;
+
+// -6～-1：左转；0：直游；1～6：右转。
+static volatile int8_t manualLevel = 0;
 
 // ==================================================
 // 双线语音控制：
@@ -180,7 +194,7 @@ static void outputPosition(float position)
     if (!isfinite(position)) return;
 
     if (position < 0.0f) position = 0.0f;
-    if (position > 270.0f) position = 270.0f;
+    if (position > 180.0f) position = 180.0f;
 
     currentPosition = position;
 
@@ -195,10 +209,11 @@ static void outputPosition(float position)
 static float swimPosition(
     uint64_t phase,
     float left,
-    float right)
+    float right,
+    uint64_t period = PERIOD_US)
 {
     float wave = sinf(
-        2.0f * PI_F * (float)phase / (float)PERIOD_US);
+        2.0f * PI_F * (float)phase / (float)period);
 
     float magnitude = fabsf(wave);
     float common = fminf(CENTER - left, right - CENTER);
@@ -282,8 +297,61 @@ static float routePosition(uint64_t t)
     return CENTER;
 }
 
+static void stopMotion() {
+    // 立即结束语音会话，并平滑回到舵机中心。
+    voiceEndSession();
+
+    if (mode == ROUTE || mode == MANUAL) {
+        stopFrom = currentPosition;
+        elapsedUs = 0;
+        mode = STOPPING;
+        manualLevel = 0;
+    }
+}
+
+static const char *manualState()
+{
+    static char state[32];
+
+    int level = manualLevel;
+
+    if (level == 0) {
+        return "MANUAL_STATE STRAIGHT";
+    }
+
+    snprintf(
+        state,
+        sizeof(state),
+        "MANUAL_STATE %s_%d",
+        level < 0 ? "LEFT" : "RIGHT",
+        level < 0 ? -level : level);
+
+    return state;
+}
+
+static float manualPosition()
+{
+    // 换挡时不重置摆动周期，尾鳍始终连续摆动。
+    manualPhaseUs = (manualPhaseUs + FRAME_US) % swimPeriodUs;
+
+    // 0挡90°，左六挡30°，右六挡150°。
+    float center = CENTER + 10.0f * manualLevel;
+
+    return center
+        + swimPosition(
+            manualPhaseUs,
+            manualLeft,
+            manualRight,
+            swimPeriodUs)
+        - CENTER;
+}
+
 static void onFrame()
 {
+    if (mode == MANUAL) {
+        manualLeaseUs += FRAME_US;
+        if (manualLeaseUs >= MANUAL_LEASE_US) stopMotion();
+    }
     if (mode != IDLE) {
         elapsedUs += FRAME_US;
 
@@ -291,6 +359,8 @@ static void onFrame()
 
         if (mode == ROUTE) {
             position = routePosition(elapsedUs);
+        } else if (mode == MANUAL) {
+            position = manualPosition();
         } else {
             position = blend(
                 stopFrom, CENTER, elapsedUs, MOVE_US);
@@ -309,7 +379,7 @@ static void onFrame()
         voiceEndSession();
     }
 
-    // 舵机停止后，仍继续完成END脉冲。
+    // 舵机停止后，仍继续完成语音释放间隔。
     voiceOnFrame();
 }
 
@@ -370,7 +440,100 @@ static void processLine(char *text)
 
     if (count == 3 &&
         strcmp(parts[1], "HELLO") == 0) {
-        reply(id, true, "ROUTE5_V4_2WIRE");
+        reply(id, true, "CENTER_HOLD_V2_2WIRE");
+        return;
+    }
+
+    if (count == 3 && strcmp(parts[1], "CAPS") == 0) {
+        reply(id, true, "CENTER_HOLD_V2");
+        return;
+    }
+
+    // FISH HOLD 左侧摆幅毫度 右侧摆幅毫度 周期微秒 请求ID
+    if (count == 6 && strcmp(parts[1], "HOLD") == 0) {
+        uint64_t p[3] = {};
+
+        for (unsigned i = 0; i < 3; ++i) {
+            if (!unsignedNumber(parts[i + 2], p[i])) {
+                reply(id, false, "PARAMETERS");
+                return;
+            }
+        }
+
+        if (p[0] > 30000 ||
+            p[1] > 30000 ||
+            p[2] < 100000 ||
+            p[2] > 10000000 ||
+            p[2] % FRAME_US != 0) {
+            reply(id, false, "RANGE");
+            return;
+        }
+
+        noInterrupts();
+
+        if (mode != IDLE || voiceBusy()) {
+            interrupts();
+            reply(id, false, "BUSY");
+            return;
+        }
+
+        manualLeft = CENTER - p[0] / 1000.0f;
+        manualRight = CENTER + p[1] / 1000.0f;
+        swimPeriodUs = p[2];
+
+        manualLeaseUs = 0;
+        manualPhaseUs = 0;
+        elapsedUs = 0;
+        manualLevel = 0;
+
+        voiceBeginSession();
+        outputPosition(CENTER);
+        mode = MANUAL;
+
+        interrupts();
+
+        reply(id, true, "HOLD");
+        return;
+    }
+
+    // FISH LEVEL L/R/N 挡位 请求ID
+    // L/R对应1～6挡，N必须配0挡。
+    // 此命令同时作为运行心跳。
+    if (count == 5 && strcmp(parts[1], "LEVEL") == 0) {
+        uint64_t level = 0;
+
+        bool left = strcmp(parts[2], "L") == 0;
+        bool right = strcmp(parts[2], "R") == 0;
+        bool neutral = strcmp(parts[2], "N") == 0;
+
+        if (!unsignedNumber(parts[3], level) ||
+            (!left && !right && !neutral) ||
+            level > 6 ||
+            (neutral && level != 0) ||
+            (!neutral && level == 0)) {
+            reply(id, false, "PARAMETERS");
+            return;
+        }
+
+        noInterrupts();
+
+        if (mode != MANUAL) {
+            interrupts();
+            reply(id, false, "NOT_MANUAL");
+            return;
+        }
+
+        manualLeaseUs = 0;
+
+        manualLevel = neutral
+            ? 0
+            : (left ? -(int8_t)level : (int8_t)level);
+
+        const char *state = manualState();
+
+        interrupts();
+
+        reply(id, true, state);
         return;
     }
 
@@ -391,7 +554,7 @@ static void processLine(char *text)
 
         noInterrupts();
 
-        if (mode == ROUTE && voiceSession) {
+        if ((mode == ROUTE || mode == MANUAL) && voiceSession) {
             bool duplicate = false;
 
             for (uint8_t i = 0; i < voiceAccepted; ++i) {
@@ -435,9 +598,10 @@ static void processLine(char *text)
         noInterrupts();
 
         stateValue = mode;
+        if (stateValue == MANUAL) stateValue = ROUTE;
 
-        // 2：运动已经结束，正在发送语音结束指令。
-        // 此时暂不允许下一轮开始，防止START与END交错。
+        // 2：运动已经结束，正在等待语音释放间隔。
+        // 此时暂不允许下一轮开始，避免两轮运行状态混淆。
         if (stateValue == IDLE && voiceBusy()) {
             stateValue = 2;
         }
@@ -459,16 +623,8 @@ static void processLine(char *text)
 
         noInterrupts();
 
-        // 立即关闭语音事件接收，并安排END。
-        voiceEndSession();
-
-        // 已经在回中时，重复STOP不重新计时。
-        // 空闲时收到STOP，也不额外驱动舵机。
-        if (mode == ROUTE) {
-            stopFrom = currentPosition;
-            elapsedUs = 0;
-            mode = STOPPING;
-        }
+        // 立即关闭语音事件接收，并释放运行状态和漏油输出。
+        stopMotion();
 
         interrupts();
 
@@ -476,62 +632,7 @@ static void processLine(char *text)
         return;
     }
 
-    if (count != 18 ||
-        strcmp(parts[1], "ROUTE") != 0) {
-        reply(id, false, "PARAMETERS");
-        return;
-    }
-
-    // 完整检查五段参数，通过后才开始执行。
-    uint64_t next[5][3];
-
-    for (unsigned i = 0; i < 5; ++i) {
-        for (unsigned j = 0; j < 3; ++j) {
-            if (!unsignedNumber(
-                    parts[2 + i * 3 + j],
-                    next[i][j])) {
-                reply(id, false, "PARAMETERS");
-                return;
-            }
-        }
-
-        bool valid = (i % 2) == 0
-            ? (next[i][0] <= 90000 &&
-               next[i][1] >= 90000 &&
-               next[i][1] <= 180000 &&
-               next[i][2] <= 1000000000ULL)
-            : (next[i][0] >= 90000 &&
-               next[i][0] <= 270000 &&
-               next[i][1] <= 3600000000ULL &&
-               next[i][2] >= 20000 &&
-               next[i][2] <= 3600000000ULL);
-
-        if (!valid) {
-            reply(id, false, "RANGE");
-            return;
-        }
-    }
-
-    noInterrupts();
-
-    if (mode != IDLE || voiceBusy()) {
-        interrupts();
-        reply(id, false, "BUSY");
-        return;
-    }
-
-    memcpy(plan, next, sizeof(plan));
-    elapsedUs = 0;
-
-    // 安排START，不等待400ms脉冲或语音播放。
-    voiceBeginSession();
-
-    outputPosition(CENTER);
-    mode = ROUTE;
-
-    interrupts();
-
-    reply(id, true, "ROUTE");
+    reply(id, false, "EXPERIMENT_COMMAND_REQUIRED");
 }
 
 void setup()

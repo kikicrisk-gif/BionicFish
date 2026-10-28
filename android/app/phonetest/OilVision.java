@@ -149,6 +149,12 @@ public final class OilVision {
         });
     }
 
+    public boolean isClosing() { return closing; }
+
+    public boolean isCameraRequested() { return wanted && !closing; }
+
+    public boolean isRunning() { return run != null && run.accepting && !closing; }
+
     public boolean isBusy() {
         return closing || run != null;
     }
@@ -266,12 +272,12 @@ public final class OilVision {
                         preparedId + ".mp4");
                 values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
                 values.put(MediaStore.Video.Media.RELATIVE_PATH,
-                        "Movies/FishTail");
+                        FishStorage.VIDEOS);
 
                 MediaStoreOutputOptions output =
                         new MediaStoreOutputOptions.Builder(
                                 activity.getContentResolver(),
-                                MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                                MediaStore.Downloads.EXTERNAL_CONTENT_URI)
                                 .setContentValues(values)
                                 .build();
 
@@ -320,7 +326,7 @@ public final class OilVision {
                         "confirm_samples", 3,
                         "clear_samples", 5)));
 
-        prepare(saveVideo);
+        prepare(true);
 
         if (bound && saveVideo) {
             startVideo(current);

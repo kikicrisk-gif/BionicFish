@@ -38,7 +38,7 @@ final class VisionLog implements AutoCloseable {
         values.put(MediaStore.MediaColumns.MIME_TYPE,
                 "application/x-ndjson");
         values.put(MediaStore.MediaColumns.RELATIVE_PATH,
-                "Download/FishTail");
+                FishStorage.LOGS);
         values.put(MediaStore.MediaColumns.IS_PENDING, 1);
 
         Uri created = context.getContentResolver().insert(
@@ -111,11 +111,11 @@ final class VisionLog implements AutoCloseable {
         values.put(MediaStore.Images.Media.DISPLAY_NAME, name + ".jpg");
         values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
         values.put(MediaStore.Images.Media.RELATIVE_PATH,
-                "Pictures/FishTail");
+                FishStorage.PICTURES);
         values.put(MediaStore.Images.Media.IS_PENDING, 1);
 
         Uri uri = context.getContentResolver().insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
 
         if (uri == null) {
             throw new IllegalStateException("无法创建触发关键帧");

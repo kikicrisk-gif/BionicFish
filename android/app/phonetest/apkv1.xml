@@ -12,7 +12,7 @@
         android:required="true" />
 
     <application
-        android:label="FishTail录像控制"
+        android:label="FishTail中心转弯实验版"
         android:allowBackup="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
