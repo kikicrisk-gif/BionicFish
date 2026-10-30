@@ -1,9 +1,11 @@
 plugins {
-    id 'com.android.application' version '8.7.3' apply false
+    id 'com.android.application' version '9.4.0' apply false
 }
 
 project(':app') {
     apply plugin: 'com.android.application'
+    // Optional reuse of the unchanged JNI binary from the colleague's v20 APK.
+    def reuseVisionBinary = providers.gradleProperty('reuseVisionBinary').map { it.toBoolean() }.getOrElse(false)
 
     layout.buildDirectory.set(
             rootProject.layout.projectDirectory.dir('build/app')
@@ -11,7 +13,8 @@ project(':app') {
 
     android {
         namespace 'com.fish.phonetailtest'
-        compileSdk 35
+        compileSdk 37
+        buildToolsVersion '37.0.0'
         ndkVersion '30.0.16248370'
 
         defaultConfig {
@@ -19,19 +22,19 @@ project(':app') {
             minSdk 30
             targetSdk 35
 
-            versionCode 14
-            versionName '14.0'
+            versionCode 1
+            versionName '1.0-center-experiment'
 
             ndk {
                 abiFilters 'arm64-v8a'
             }
 
-            externalNativeBuild {
+            if (!reuseVisionBinary) { externalNativeBuild {
                 cmake {
                     cppFlags '-std=c++17'
                     arguments '-DANDROID_STL=c++_shared'
                 }
-            }
+            } }
         }
 
         compileOptions {
@@ -39,20 +42,29 @@ project(':app') {
             targetCompatibility JavaVersion.VERSION_17
         }
 
+        buildTypes {
+            debug {
+                // The colleague's signing key was not included in the source archive.
+                // Keep their installed application available during water testing.
+                applicationIdSuffix '.centerexperiment'
+            }
+        }
+
         sourceSets {
             main {
                 java.srcDirs = ['phonetest']
                 assets.srcDirs = ['vision/assets']
                 manifest.srcFile 'phonetest/apkv1.xml'
+                if (reuseVisionBinary) jniLibs.srcDirs = ['vision/prebuilt']
             }
         }
 
-        externalNativeBuild {
+        if (!reuseVisionBinary) { externalNativeBuild {
             cmake {
                 path file('vision/cpp/CMakeLists.txt')
                 version '3.31.6'
             }
-        }
+        } }
     }
 
     dependencies {

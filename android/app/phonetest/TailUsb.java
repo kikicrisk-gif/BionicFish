@@ -9,10 +9,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class TailUsb {
     public enum Event {
-        READY, CHECKED, STARTED, FINISHING, STOPPED, ERROR
+        READY, CHECKED, STARTED, MANUAL_UPDATE, FINISHING, STOPPED, ERROR
     }
 
     public interface Listener {
@@ -21,6 +22,30 @@ public final class TailUsb {
 
     public interface VoiceCallback {
         void complete(String status, String message);
+    }
+
+    public enum VoiceProtocol {
+        UNKNOWN("", "", "UNKNOWN"),
+        SINGLE_WIRE("PB11", "", "SESSION_PULSES"),
+        TWO_WIRE("PB1", "PB11", "RUN_LEVEL_AND_LEAK_PULSE");
+
+        public final String leakGpio, runGpio, logName;
+        VoiceProtocol(String leakGpio, String runGpio, String logName) {
+            this.leakGpio = leakGpio;
+            this.runGpio = runGpio;
+            this.logName = logName;
+        }
+    }
+
+    public volatile VoiceProtocol voiceProtocol = VoiceProtocol.UNKNOWN;
+
+    private void handshake() throws IOException {
+        String firmware = request("HELLO");
+        if (!"CENTER_HOLD_V2_2WIRE".equals(firmware)) {
+            voiceProtocol = VoiceProtocol.UNKNOWN;
+            throw new IOException("请烧录中心转弯实验固件；当前固件：" + firmware);
+        }
+        voiceProtocol = VoiceProtocol.TWO_WIRE;
     }
 
     private static final class CommandRejectedException
@@ -50,6 +75,166 @@ public final class TailUsb {
 
     public volatile boolean ready;
     public volatile boolean running;
+    public volatile boolean manualSupported;
+    public volatile boolean strongSupported;
+    public volatile boolean manualRunning;
+    public volatile boolean manualTurning;
+    public volatile String manualState = "STOPPED";
+
+    // 已由主控应答确认的挡位，按操作者左右方向表示。
+    public volatile int manualLevel;
+
+    // 最新期望挡位。松手直接覆盖为0，不排队累积旧挡位。
+    private volatile int desiredLevel;
+
+    private final AtomicInteger steeringRevision = new AtomicInteger();
+
+    private boolean reverseManual;
+    private int manualToken;
+
+    private void readCapabilities() throws IOException {
+        strongSupported = false;
+        manualSupported =
+                "CENTER_HOLD_V2".equals(request("CAPS"));
+
+        if (!manualSupported) {
+            throw new IOException("请烧录配套的六挡长按主控固件");
+        }
+    }
+
+    private void resetManual() {
+        manualRunning = false;
+        manualTurning = false;
+        manualState = "STOPPED";
+        manualLevel = 0;
+        desiredLevel = 0;
+
+        steeringRevision.incrementAndGet();
+        io.removeCallbacks(manualTick);
+    }
+
+    private void manualAnswer(int token, String answer)
+            throws IOException {
+
+        if (!answer.matches(
+                "MANUAL_STATE (STRAIGHT|LEFT_[1-6]|RIGHT_[1-6])")) {
+            throw new IOException("主控挡位应答不匹配：" + answer);
+        }
+
+        if (token != generation.get() || !manualRunning) return;
+
+        String state = answer.substring("MANUAL_STATE ".length());
+
+        int level = 0;
+
+        if (!"STRAIGHT".equals(state)) {
+            level = state.charAt(state.length() - 1) - '0';
+
+            if (state.startsWith("LEFT_")) {
+                level = -level;
+            }
+        }
+
+        if (reverseManual) {
+            level = -level;
+        }
+
+        manualLevel = level;
+        manualTurning = false;
+
+        manualState = level == 0
+                ? "STRAIGHT"
+                : (level < 0 ? "LEFT_" : "RIGHT_") + Math.abs(level);
+
+        report(token, Event.MANUAL_UPDATE, manualState);
+    }
+
+    private String levelCommand(int level) {
+        int physical = reverseManual ? -level : level;
+
+        if (physical == 0) {
+            return "LEVEL N 0";
+        }
+
+        return "LEVEL "
+                + (physical < 0 ? "L " : "R ")
+                + Math.abs(physical);
+    }
+
+    private final Runnable manualTick = new Runnable() {
+        @Override
+        public void run() {
+            int token = manualToken;
+
+            if (token != generation.get() ||
+                    !manualRunning || !ready) {
+                return;
+            }
+
+            int revision = steeringRevision.get();
+            int level = desiredLevel;
+
+            try {
+                manualAnswer(
+                        token,
+                        request(levelCommand(level), 300));
+
+                if (token != generation.get() ||
+                        !manualRunning || !ready) {
+                    return;
+                }
+
+                io.removeCallbacks(this);
+
+                // 状态变化立即发送；稳定状态每200ms保活。
+                io.postDelayed(
+                        this,
+                        revision == steeringRevision.get() ? 200 : 0);
+
+            } catch (Exception error) {
+                fail(token, error);
+            }
+        }
+    };
+
+    public void setLevel(int level) {
+        if (level < -6 || level > 6) {
+            throw new IllegalArgumentException("挡位必须是-6～6");
+        }
+
+        if (!manualRunning || !ready) return;
+
+        desiredLevel = level;
+        steeringRevision.incrementAndGet();
+
+        io.removeCallbacks(manualTick);
+        io.post(manualTick);
+    }
+
+    public void startManual(ManualConfig source) {
+        ManualConfig c = source.copy();
+        String command = c.command();
+        if (!manualSupported) {
+            report(generation.get(), Event.ERROR, "请先烧录配套的中心转弯实验固件。");
+            return;
+        }
+        resetManual();
+        final int token = generation.incrementAndGet();
+        running = true;
+        io.post(() -> {
+            if (token != generation.get()) return;
+            try {
+                expect(command, "HOLD");
+                if (token != generation.get()) return;
+                reverseManual = c.reverse;
+                manualToken = token;
+                manualRunning = true;
+                manualState = "STRAIGHT";
+                report(token, Event.STARTED, "手动操控已开始，默认持续直游");
+                io.post(manualTick);
+            } catch (Exception e) { fail(token, e); }
+        });
+    }
 
     public TailUsb(
             UsbManager manager, Listener listener) {
@@ -138,7 +323,7 @@ public final class TailUsb {
         }
 
         throw new IOException(
-                "应答超时；请确认已烧录ROUTE5_V4_2WIRE固件");
+                "应答超时；请检查USB连接和配套主控固件（CENTER_HOLD_V2_2WIRE）");
     }
 
     private void expect(
@@ -167,6 +352,10 @@ public final class TailUsb {
     }
 
     public void open(UsbDevice device) {
+        resetManual();
+        manualSupported = false;
+        strongSupported = false;
+        voiceProtocol = VoiceProtocol.UNKNOWN;
         int token = generation.incrementAndGet();
 
         ready = false;
@@ -203,7 +392,8 @@ public final class TailUsb {
                 port.setDTR(true);
                 port.setRTS(false);
 
-                expect("HELLO", "ROUTE5_V4_2WIRE");
+                handshake();
+                readCapabilities();
 
                 boolean busy = readBusy();
 
@@ -234,7 +424,8 @@ public final class TailUsb {
                     throw new IOException("USB未连接");
                 }
 
-                expect("HELLO", "ROUTE5_V4_2WIRE");
+                handshake();
+                readCapabilities();
 
                 boolean busy = readBusy();
 
@@ -288,7 +479,7 @@ public final class TailUsb {
 
                 if ("VOICE_QUEUED".equals(answer)) {
                     status = "QUEUED";
-                    message = "主控已接收，已安排PB1漏油脉冲";
+                    message = "主控已接收，已安排" + voiceProtocol.leakGpio + "漏油脉冲";
 
                 } else if ("VOICE_DUPLICATE".equals(answer)) {
                     status = "DUPLICATE";
@@ -326,6 +517,7 @@ public final class TailUsb {
     }
 
     public void startRoute(RouteConfig source) {
+        resetManual();
         RouteConfig c = source.copy();
         begin(c.command(), "ROUTE");
     }
@@ -382,7 +574,7 @@ public final class TailUsb {
                     monitor(token);
                 } else {
                     report(token, Event.STOPPED,
-                            "运动已结束，语音结束脉冲已发送完成");
+                            "运动及语音控制收尾已完成");
                 }
 
             } catch (Exception e) {
@@ -392,6 +584,7 @@ public final class TailUsb {
     }
 
     public void stop() {
+        resetManual();
         int token = generation.incrementAndGet();
 
         io.post(() -> {
@@ -433,6 +626,8 @@ public final class TailUsb {
     private void fail(int token, Exception error) {
         if (token != generation.get()) return;
 
+        resetManual();
+
         ready = false;
         running = false;
 
@@ -463,6 +658,7 @@ public final class TailUsb {
     }
 
     public void close() {
+        resetManual();
         generation.incrementAndGet();
 
         ready = false;
